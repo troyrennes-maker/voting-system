@@ -5,7 +5,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 const INSTANT_API = 'https://api.instantdb.com/admin';
-const SESSION_TTL = 30 * 60 * 1000; // 30 minutes in ms
+const SESSION_TTL = 30 * 60 * 1000;
 
 const candidates = [
   { id: '1', name: 'Alice Johnson' },
@@ -34,7 +34,7 @@ async function dbQuery(query) {
 }
 
 async function dbTransact(steps) {
-  const res = await fetch(`${INSTANT_API}/transact`, {
+  await fetch(`${INSTANT_API}/transact`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -42,25 +42,20 @@ async function dbTransact(steps) {
     },
     body: JSON.stringify({ appId: process.env.VITE_INSTANT_APP_ID, steps })
   });
-  return res.json();
 }
 
-// ─── Session Helpers (InstantDB-backed) ───────────────────────────────────────
+// ─── Session Helpers ──────────────────────────────────────────────────────────
 
-async function getSession(sessionId) {
+async function getSession(atSessionId) {
   try {
     const data = await dbQuery({ userSessions: {} });
     const sessions = data?.userSessions || [];
-    // Use Africa's Talking sessionId as the primary key
-    const session = sessions.find(s => s.atSessionId === sessionId && s.status === 'incomplete');
+    const session = sessions.find(s => s.atSessionId === atSessionId);
     if (!session) return null;
-
-    // Expire sessions older than 30 minutes
     if (Date.now() - session.createdAt > SESSION_TTL) {
       await deleteSession(session.id);
       return null;
     }
-
     return session;
   } catch (err) {
     console.error('getSession error:', err);
@@ -74,12 +69,10 @@ async function getSessionByPhone(phone) {
     const sessions = data?.userSessions || [];
     const session = sessions.find(s => s.phone === phone && s.status === 'incomplete');
     if (!session) return null;
-
     if (Date.now() - session.createdAt > SESSION_TTL) {
       await deleteSession(session.id);
       return null;
     }
-
     return session;
   } catch (err) {
     console.error('getSessionByPhone error:', err);
@@ -93,10 +86,7 @@ async function saveSession(sessionDbId, data) {
       action: 'update',
       entity: 'userSessions',
       id: sessionDbId,
-      data: {
-        ...data,
-        updatedAt: Date.now()
-      }
+      data: { ...data, updatedAt: Date.now() }
     }]);
   } catch (err) {
     console.error('saveSession error:', err);
@@ -118,7 +108,6 @@ async function deleteSession(sessionDbId) {
 // ─── Validation ───────────────────────────────────────────────────────────────
 
 function isValidStudentId(id) {
-  // Must be exactly 10 digits and start with 24, 42, or 14
   return /^\d{10}$/.test(id) && /^(24|42|14)/.test(id);
 }
 
@@ -173,35 +162,36 @@ async function saveVote(session, candidateName) {
 
 app.post('/ussd', async (req, res) => {
   const { sessionId, phoneNumber, text } = req.body;
+
+  // lastInput is always only the most recent thing the user typed
   const parts = text ? text.split('*') : [''];
   const lastInput = parts[parts.length - 1].trim();
 
-  console.log('DEBUG → sessionId:', sessionId, '| text:', JSON.stringify(text), '| lastInput:', lastInput, '| phone:', phoneNumber);
+  const sessionDbId = `session_${sessionId}`;
+
+  console.log('DEBUG → sessionId:', sessionId, '| text:', JSON.stringify(text), '| lastInput:', lastInput);
+
+  let session = await getSession(sessionId);
+  console.log('DEBUG → session step:', session?.step, '| studentId:', session?.studentId);
 
   let response = '';
 
-  // Use Africa's Talking sessionId as the DB record ID — always consistent
-  const sessionDbId = `session_${sessionId}`;
-
-  // Look up session using AT sessionId
-  let session = await getSession(sessionId);
-
-  // ── Step 1: Fresh dial ──
+  // ── Step 1: Fresh dial (text is empty) ──
   if (!text || text === '') {
-    // Check for an existing incomplete session by phone (for resumption)
-    const existingSession = await getSessionByPhone(phoneNumber);
+    const prevSession = await getSessionByPhone(phoneNumber);
 
-    if (existingSession) {
-      // Resuming a previous session
-      if (existingSession.step === 'ghanaCard') {
+    if (prevSession) {
+      // Re-link previous session to new AT sessionId for this call
+      await saveSession(prevSession.id, { ...prevSession, atSessionId: sessionId });
+
+      if (prevSession.step === 'ghanaCard') {
         response = `CON Welcome back!\nYour Student ID is saved.\nEnter your Ghana Card number:\n(Format: GHA-XXXXXXXXX-X)`;
-      } else if (existingSession.step === 'voting') {
-        response = `CON Welcome back! Continue voting:\n` + getPage(existingSession.page || 1).replace('CON ', '');
+      } else if (prevSession.step === 'voting') {
+        response = `CON Welcome back! Continue voting:\n` + getPage(prevSession.page || 1).replace('CON ', '');
       } else {
         response = `CON Welcome to the Voting System\nEnter your Student ID:`;
       }
     } else {
-      // Brand new session
       await saveSession(sessionDbId, {
         atSessionId: sessionId,
         phone: phoneNumber,
@@ -212,13 +202,12 @@ app.post('/ussd', async (req, res) => {
       response = `CON Welcome to the Voting System\nEnter your Student ID:`;
     }
 
-  // ── Step 2: Collect Student ID ──
-  } else if (!session?.studentId) {
+  // ── Step 2: Student ID ──
+  } else if (!session || session.step === 'studentId') {
     const studentId = lastInput;
     if (!isValidStudentId(studentId)) {
       response = `CON Invalid Student ID.\nMust be 10 digits starting with 24, 42, or 14.\nEnter your Student ID:`;
     } else {
-      // Always save using sessionDbId — no conditional check needed
       await saveSession(sessionDbId, {
         atSessionId: sessionId,
         phone: phoneNumber,
@@ -230,14 +219,13 @@ app.post('/ussd', async (req, res) => {
       response = `CON Enter your Ghana Card number:\n(Format: GHA-XXXXXXXXX-X)`;
     }
 
-  // ── Step 3: Collect Ghana Card ──
-  } else if (!session?.ghanaCard) {
+  // ── Step 3: Ghana Card ──
+  } else if (session.step === 'ghanaCard') {
     const ghanaCard = lastInput.toUpperCase();
     if (!isValidGhanaCard(ghanaCard)) {
       response = `CON Invalid Ghana Card format.\nEnter your Ghana Card number:\n(Format: GHA-XXXXXXXXX-X)`;
     } else {
       const alreadyVoted = await checkIfVoted(session.studentId, ghanaCard, phoneNumber);
-
       if (alreadyVoted) {
         await deleteSession(sessionDbId);
         response = `END Sorry, you have already voted. Access denied.`;
@@ -252,52 +240,53 @@ app.post('/ussd', async (req, res) => {
       }
     }
 
-  // ── Step 4: Candidate selection / pagination ──
-  } else {
-    if (!session) {
-      response = `END Session expired. Please dial again.`;
-    } else {
-      const choice = lastInput;
-      let page = session.page || 1;
+  // ── Step 4: Voting ──
+  } else if (session.step === 'voting') {
+    const choice = lastInput;
+    let page = session.page || 1;
 
-      if (choice === '4' && page === 1) {
-        page = 2;
-        await saveSession(sessionDbId, { ...session, page });
-        response = getPage(2);
+    if (choice === '4' && page === 1) {
+      page = 2;
+      await saveSession(sessionDbId, { ...session, page });
+      response = getPage(2);
 
-      } else if (choice === '4' && page === 2) {
-        page = 3;
-        await saveSession(sessionDbId, { ...session, page });
-        response = getPage(3);
+    } else if (choice === '4' && page === 2) {
+      page = 3;
+      await saveSession(sessionDbId, { ...session, page });
+      response = getPage(3);
 
-      } else if (choice === '0' && page === 2) {
-        page = 1;
-        await saveSession(sessionDbId, { ...session, page });
-        response = getPage(1);
+    } else if (choice === '0' && page === 2) {
+      page = 1;
+      await saveSession(sessionDbId, { ...session, page });
+      response = getPage(1);
 
-      } else if (choice === '0' && page === 3) {
-        page = 2;
-        await saveSession(sessionDbId, { ...session, page });
-        response = getPage(2);
+    } else if (choice === '0' && page === 3) {
+      page = 2;
+      await saveSession(sessionDbId, { ...session, page });
+      response = getPage(2);
 
-      } else if (['1', '2', '3'].includes(choice)) {
-        const offsets = { 1: 0, 2: 3, 3: 6 };
-        const candidateIndex = offsets[page] + (parseInt(choice) - 1);
-        const candidate = candidates[candidateIndex];
+    } else if (['1', '2', '3'].includes(choice)) {
+      const offsets = { 1: 0, 2: 3, 3: 6 };
+      const candidateIndex = offsets[page] + (parseInt(choice) - 1);
+      const candidate = candidates[candidateIndex];
 
-        if (!candidate) {
-          response = `CON Invalid choice. Try again.\n` + getPage(page).replace('CON ', '');
-        } else {
-          await saveVote(session, candidate.name);
-          await deleteSession(sessionDbId);
-          response = `END Thank you! You have successfully voted for ${candidate.name}.`;
-        }
-
-      } else {
+      if (!candidate) {
         response = `CON Invalid choice. Try again.\n` + getPage(page).replace('CON ', '');
+      } else {
+        await saveVote(session, candidate.name);
+        await deleteSession(sessionDbId);
+        response = `END Thank you! You have successfully voted for ${candidate.name}.`;
       }
+
+    } else {
+      response = `CON Invalid choice. Try again.\n` + getPage(page).replace('CON ', '');
     }
+
+  } else {
+    response = `END Something went wrong. Please dial again.`;
   }
+
+  console.log('DEBUG → response:', response.substring(0, 80));
 
   res.set('Content-Type', 'text/plain');
   res.send(response);
