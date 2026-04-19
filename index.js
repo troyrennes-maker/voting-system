@@ -34,7 +34,7 @@ async function dbQuery(query) {
 }
 
 async function dbTransact(steps) {
-  await fetch(`${INSTANT_API}/transact`, {
+  const res = await fetch(`${INSTANT_API}/transact`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -42,6 +42,7 @@ async function dbTransact(steps) {
     },
     body: JSON.stringify({ appId: process.env.VITE_INSTANT_APP_ID, steps })
   });
+  return res.json();
 }
 
 // ─── Session Helpers ──────────────────────────────────────────────────────────
@@ -80,14 +81,31 @@ async function getSessionByPhone(phone) {
   }
 }
 
-async function saveSession(sessionDbId, data) {
+// createSession uses 'merge' — creates the record if it doesn't exist yet
+async function createSession(sessionDbId, data) {
   try {
-    await dbTransact([{
-      action: 'update',
+    const result = await dbTransact([{
+      action: 'merge',
       entity: 'userSessions',
       id: sessionDbId,
       data: { ...data, updatedAt: Date.now() }
     }]);
+    console.log('createSession result:', JSON.stringify(result));
+  } catch (err) {
+    console.error('createSession error:', err);
+  }
+}
+
+// saveSession uses 'merge' too — safe for both create and update
+async function saveSession(sessionDbId, data) {
+  try {
+    const result = await dbTransact([{
+      action: 'merge',
+      entity: 'userSessions',
+      id: sessionDbId,
+      data: { ...data, updatedAt: Date.now() }
+    }]);
+    console.log('saveSession result:', JSON.stringify(result));
   } catch (err) {
     console.error('saveSession error:', err);
   }
@@ -142,7 +160,7 @@ async function saveVote(session, candidateName) {
   try {
     const voteId = `vote_${Date.now()}`;
     await dbTransact([{
-      action: 'update',
+      action: 'merge',
       entity: 'votes',
       id: voteId,
       data: {
@@ -172,7 +190,7 @@ app.post('/ussd', async (req, res) => {
   console.log('DEBUG → sessionId:', sessionId, '| text:', JSON.stringify(text), '| lastInput:', lastInput);
 
   let session = await getSession(sessionId);
-  console.log('DEBUG → session step:', session?.step, '| studentId:', session?.studentId);
+  console.log('DEBUG → session found:', !!session, '| step:', session?.step, '| studentId:', session?.studentId);
 
   let response = '';
 
@@ -192,7 +210,8 @@ app.post('/ussd', async (req, res) => {
         response = `CON Welcome to the Voting System\nEnter your Student ID:`;
       }
     } else {
-      await saveSession(sessionDbId, {
+      // CREATE a brand new session record using merge (safe upsert)
+      await createSession(sessionDbId, {
         atSessionId: sessionId,
         phone: phoneNumber,
         status: 'incomplete',
@@ -208,7 +227,8 @@ app.post('/ussd', async (req, res) => {
     if (!isValidStudentId(studentId)) {
       response = `CON Invalid Student ID.\nMust be 10 digits starting with 24, 42, or 14.\nEnter your Student ID:`;
     } else {
-      await saveSession(sessionDbId, {
+      // Use createSession (merge) so it works even if Step 1 session wasn't saved yet
+      await createSession(sessionDbId, {
         atSessionId: sessionId,
         phone: phoneNumber,
         status: 'incomplete',
