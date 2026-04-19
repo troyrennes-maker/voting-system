@@ -8,7 +8,7 @@ const INSTANT_API = 'https://api.instantdb.com/admin';
 const SESSION_TTL = 30 * 60 * 1000;
 
 // Use INSTANT_APP_ID (without VITE_ prefix) for Node.js backend
-const INSTANT_APP_ID = process.env.INSTANT_APP_ID || process.env.VITE_INSTANT_APP_ID;
+const INSTANT_APP_ID = process.env.INSTANT_APP_ID || (process.env.INSTANT_APP_ID || process.env.VITE_INSTANT_APP_ID);
 console.log('ENV CHECK → INSTANT_APP_ID:', INSTANT_APP_ID ? '✓ loaded' : '✗ MISSING');
 console.log('ENV CHECK → ADMIN_TOKEN:', process.env.INSTANT_APP_ADMIN_TOKEN ? '✓ loaded' : '✗ MISSING');
 
