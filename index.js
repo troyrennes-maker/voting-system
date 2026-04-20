@@ -7,7 +7,6 @@ app.use(express.json());
 const INSTANT_API = 'https://api.instantdb.com/admin';
 const SESSION_TTL = 30 * 60 * 1000;
 
-// Use INSTANT_APP_ID (without VITE_ prefix) for Node.js backend
 const INSTANT_APP_ID = process.env.INSTANT_APP_ID || process.env.VITE_INSTANT_APP_ID;
 console.log('ENV CHECK → INSTANT_APP_ID:', INSTANT_APP_ID ? '✓ loaded' : '✗ MISSING');
 console.log('ENV CHECK → ADMIN_TOKEN:', process.env.INSTANT_APP_ADMIN_TOKEN ? '✓ loaded' : '✗ MISSING');
@@ -88,7 +87,6 @@ async function getSessionByPhone(phone) {
   }
 }
 
-// createSession uses 'merge' — creates the record if it doesn't exist yet
 async function createSession(sessionDbId, data) {
   try {
     const result = await dbTransact([{
@@ -103,7 +101,6 @@ async function createSession(sessionDbId, data) {
   }
 }
 
-// saveSession uses 'merge' too — safe for both create and update
 async function saveSession(sessionDbId, data) {
   try {
     const result = await dbTransact([{
@@ -188,7 +185,6 @@ async function saveVote(session, candidateName) {
 app.post('/ussd', async (req, res) => {
   const { sessionId, phoneNumber, text } = req.body;
 
-  // lastInput is always only the most recent thing the user typed
   const parts = text ? text.split('*') : [''];
   const lastInput = parts[parts.length - 1].trim();
 
@@ -199,6 +195,9 @@ app.post('/ussd', async (req, res) => {
   let session = await getSession(sessionId);
   console.log('DEBUG → session found:', !!session, '| step:', session?.step, '| studentId:', session?.studentId);
 
+  // Normalize step: InstantDB stores it as an array, we read the first element
+  const currentStep = Array.isArray(session?.step) ? session.step[0] : session?.step;
+
   let response = '';
 
   // ── Step 1: Fresh dial (text is empty) ──
@@ -206,40 +205,38 @@ app.post('/ussd', async (req, res) => {
     const prevSession = await getSessionByPhone(phoneNumber);
 
     if (prevSession) {
-      // Re-link previous session to new AT sessionId for this call
+      const prevStep = Array.isArray(prevSession.step) ? prevSession.step[0] : prevSession.step;
       await saveSession(prevSession.id, { ...prevSession, atSessionId: sessionId });
 
-      if (prevSession.step === 'ghanaCard') {
+      if (prevStep === 'ghanaCard') {
         response = `CON Welcome back!\nYour Student ID is saved.\nEnter your Ghana Card number:\n(Format: GHA-XXXXXXXXX-X)`;
-      } else if (prevSession.step === 'voting') {
+      } else if (prevStep === 'voting') {
         response = `CON Welcome back! Continue voting:\n` + getPage(prevSession.page || 1).replace('CON ', '');
       } else {
         response = `CON Welcome to the Voting System\nEnter your Student ID:`;
       }
     } else {
-      // CREATE a brand new session record using merge (safe upsert)
       await createSession(sessionDbId, {
         atSessionId: sessionId,
         phone: phoneNumber,
         status: 'incomplete',
-        step: 'studentId',
+        step: ['studentId'],
         createdAt: Date.now()
       });
       response = `CON Welcome to the Voting System\nEnter your Student ID:`;
     }
 
   // ── Step 2: Student ID ──
-  } else if (!session || session.step === 'studentId') {
+  } else if (!session || currentStep === 'studentId') {
     const studentId = lastInput;
     if (!isValidStudentId(studentId)) {
       response = `CON Invalid Student ID.\nMust be 10 digits starting with 24, 42, or 14.\nEnter your Student ID:`;
     } else {
-      // Use createSession (merge) so it works even if Step 1 session wasn't saved yet
       await createSession(sessionDbId, {
         atSessionId: sessionId,
         phone: phoneNumber,
         status: 'incomplete',
-        step: 'ghanaCard',
+        step: ['ghanaCard'],
         studentId,
         createdAt: session?.createdAt || Date.now()
       });
@@ -247,7 +244,7 @@ app.post('/ussd', async (req, res) => {
     }
 
   // ── Step 3: Ghana Card ──
-  } else if (session.step === 'ghanaCard') {
+  } else if (currentStep === 'ghanaCard') {
     const ghanaCard = lastInput.toUpperCase();
     if (!isValidGhanaCard(ghanaCard)) {
       response = `CON Invalid Ghana Card format.\nEnter your Ghana Card number:\n(Format: GHA-XXXXXXXXX-X)`;
@@ -261,35 +258,35 @@ app.post('/ussd', async (req, res) => {
           ...session,
           ghanaCard,
           page: 1,
-          step: 'voting'
+          step: ['voting']
         });
         response = getPage(1);
       }
     }
 
   // ── Step 4: Voting ──
-  } else if (session.step === 'voting') {
+  } else if (currentStep === 'voting') {
     const choice = lastInput;
     let page = session.page || 1;
 
     if (choice === '4' && page === 1) {
       page = 2;
-      await saveSession(sessionDbId, { ...session, page });
+      await saveSession(sessionDbId, { ...session, page, step: ['voting'] });
       response = getPage(2);
 
     } else if (choice === '4' && page === 2) {
       page = 3;
-      await saveSession(sessionDbId, { ...session, page });
+      await saveSession(sessionDbId, { ...session, page, step: ['voting'] });
       response = getPage(3);
 
     } else if (choice === '0' && page === 2) {
       page = 1;
-      await saveSession(sessionDbId, { ...session, page });
+      await saveSession(sessionDbId, { ...session, page, step: ['voting'] });
       response = getPage(1);
 
     } else if (choice === '0' && page === 3) {
       page = 2;
-      await saveSession(sessionDbId, { ...session, page });
+      await saveSession(sessionDbId, { ...session, page, step: ['voting'] });
       response = getPage(2);
 
     } else if (['1', '2', '3'].includes(choice)) {
